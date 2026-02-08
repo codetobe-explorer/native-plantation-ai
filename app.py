@@ -1,5 +1,5 @@
 """
-AI-Powered Native Plantation Planning System
+AI-Powered Native Plantation Planning System with Tambo.ai Integration
 Streamlit interface with real ML backend integration
 """
 
@@ -18,6 +18,7 @@ import numpy as np
 from PIL import Image
 import io
 import base64
+import requests  # Added for Tambo.ai
 
 # Import our ML modules
 from src.recommendation.species import recommend_species
@@ -33,6 +34,10 @@ try:
 except ImportError:
     USE_ML_BACKEND = False
     print("Warning: ML backend not available, using mock data")
+
+# Tambo.ai Configuration
+TAMBOAI_API_KEY = os.environ.get("TAMBOAI_API_KEY", "your_tamboai_api_key_here")
+TAMBOAI_API_URL = "https://api.tambo.ai/v1/analyze"
 
 # --------------------------------------------------
 # Configuration
@@ -60,7 +65,9 @@ def init_session_state():
         "uploaded_image": None,
         "image_analysis": None,
         "terrain_stats": None,
-        "suitability_map": None
+        "suitability_map": None,
+        "tamboai_results": None,  # Added for Tambo.ai
+        "use_tamboai": False  # Added for Tambo.ai toggle
     }
     
     for key, value in defaults.items():
@@ -72,6 +79,66 @@ init_session_state()
 # --------------------------------------------------
 # Helper Functions
 # --------------------------------------------------
+
+def analyze_with_tamboai(image_data, lat, lon):
+    """Analyze image using Tambo.ai API"""
+    try:
+        # Convert image to base64
+        buffered = io.BytesIO()
+        image_data.save(buffered, format="PNG")
+        img_str = base64.b64encode(buffered.getvalue()).decode()
+        
+        # Prepare request payload
+        payload = {
+            "image": img_str,
+            "coordinates": {
+                "latitude": lat,
+                "longitude": lon
+            },
+            "analysis_type": "plantation_suitability",
+            "parameters": {
+                "return_suitability_map": True,
+                "return_species_recommendations": True,
+                "return_environmental_factors": True
+            }
+        }
+        
+        headers = {
+            "Authorization": f"Bearer {TAMBOAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        # Make API call
+        response = requests.post(
+            TAMBOAI_API_URL,
+            json=payload,
+            headers=headers,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            return {
+                "success": True,
+                "data": data,
+                "suitability_scores": data.get("suitability_scores", []),
+                "recommendations": data.get("recommended_species", []),
+                "environmental_factors": data.get("environmental_factors", {}),
+                "confidence": data.get("confidence_score", 0.0)
+            }
+        else:
+            return {
+                "success": False,
+                "error": f"API Error: {response.status_code}",
+                "data": None
+            }
+            
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "data": None
+        }
 
 def analyze_with_ml(image_data, lat, lon):
     """Analyze image using ML backend"""
@@ -106,6 +173,16 @@ def analyze_with_ml(image_data, lat, lon):
 def generate_plantation_points_ml(lat, lon, suitability_data=None):
     """Generate plantation points using ML or fallback to grid method"""
     
+    # Use Tambo.ai results if available and enabled
+    if st.session_state.tamboai_results and st.session_state.tamboai_results.get("success"):
+        suitability_scores = st.session_state.tamboai_results.get("suitability_scores")
+        if suitability_scores and len(suitability_scores) > 0:
+            points = generate_points_from_suitability(
+                lat, lon, np.array(suitability_scores), num_points=100
+            )
+            return points
+    
+    # Fall back to existing ML or grid method
     if suitability_data is not None and USE_ML_BACKEND:
         # Use ML-based generation
         points = generate_points_from_suitability(
@@ -120,7 +197,24 @@ def generate_plantation_points_ml(lat, lon, suitability_data=None):
 
 def generate_points_from_suitability(lat, lon, suitability_map, num_points=100):
     """Generate points based on ML suitability scores"""
-    height, width = suitability_map.shape
+    # Handle empty or invalid suitability maps
+    if suitability_map is None or len(suitability_map) == 0:
+        return generate_points_grid(lat, lon)
+    
+    # Ensure suitability_map is a numpy array
+    if not isinstance(suitability_map, np.ndarray):
+        suitability_map = np.array(suitability_map)
+    
+    # Check if we have a 2D array
+    if len(suitability_map.shape) < 2:
+        return generate_points_grid(lat, lon)
+    
+    height, width = suitability_map.shape if len(suitability_map.shape) == 2 else (1, len(suitability_map))
+    
+    # Flatten if needed
+    if len(suitability_map.shape) > 2:
+        suitability_map = suitability_map.flatten()
+        height, width = 1, len(suitability_map)
     
     # Find suitable pixels (score > 50)
     suitable_mask = suitability_map > 50
@@ -163,10 +257,16 @@ def generate_points_from_suitability(lat, lon, suitability_map, num_points=100):
             point_lon = lon + lon_offset
             score = float(suitable_scores[i])
             
-            # Get environmental factors
-            ndvi = min(1.0, score / 100.0)
-            water = random.uniform(0.4, 0.8)
-            soil = random.uniform(0.5, 0.9)
+            # Get environmental factors from Tambo.ai if available
+            if st.session_state.tamboai_results and st.session_state.tamboai_results.get("success"):
+                env_factors = st.session_state.tamboai_results.get("environmental_factors", {})
+                ndvi = env_factors.get("ndvi", min(1.0, score / 100.0))
+                water = env_factors.get("water_availability", random.uniform(0.4, 0.8))
+                soil = env_factors.get("soil_quality", random.uniform(0.5, 0.9))
+            else:
+                ndvi = min(1.0, score / 100.0)
+                water = random.uniform(0.4, 0.8)
+                soil = random.uniform(0.5, 0.9)
             
             species = recommend_species(ndvi, water, soil)
             
@@ -230,7 +330,7 @@ st.markdown(
     <b>🎯 How it works:</b>
     <ol>
         <li>📍 Click on the map to select a location OR upload a satellite image</li>
-        <li>🤖 AI analyzes vegetation, soil, and water availability</li>
+        <li>🤖 AI analyzes vegetation, soil, and water availability (Custom ML + Tambo.ai)</li>
         <li>🎯 System generates 100 optimal plantation coordinates</li>
         <li>🌿 Get native species recommendations for each point</li>
         <li>📥 Download the complete plantation plan</li>
@@ -246,6 +346,19 @@ st.markdown(
 with st.sidebar:
     st.header("⚙️ Configuration")
     
+    # Tambo.ai Toggle
+    st.subheader("🚀 Tambo.ai Integration")
+    use_tamboai = st.toggle("Enable Tambo.ai", 
+                          value=st.session_state.use_tamboai,
+                          help="Use Tambo.ai's satellite intelligence API")
+    st.session_state.use_tamboai = use_tamboai
+    
+    if use_tamboai:
+        if TAMBOAI_API_KEY == "your_tamboai_api_key_here":
+            st.error("⚠️ Please set TAMBOAI_API_KEY environment variable")
+        else:
+            st.success("✅ Tambo.ai API: Ready")
+    
     # Image upload
     st.subheader("📤 Upload Satellite Image")
     uploaded_file = st.file_uploader(
@@ -258,21 +371,44 @@ with st.sidebar:
         st.session_state.uploaded_image = Image.open(uploaded_file)
         st.image(st.session_state.uploaded_image, caption="Uploaded Image", use_container_width=True)
         
-        if st.button("🔍 Analyze Image with ML", type="primary"):
-            with st.spinner("Running ML analysis..."):
-                if st.session_state.lat and st.session_state.lon:
-                    ml_results = analyze_with_ml(
-                        st.session_state.uploaded_image,
-                        st.session_state.lat,
-                        st.session_state.lon
-                    )
-                    if ml_results:
-                        st.session_state.image_analysis = ml_results['results']
-                        st.session_state.terrain_stats = ml_results['terrain_stats']
-                        st.success("✅ ML Analysis complete!")
-                        st.rerun()
-                else:
-                    st.warning("Please select a location on the map first")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("🔍 Analyze with ML", type="primary"):
+                with st.spinner("Running ML analysis..."):
+                    if st.session_state.lat and st.session_state.lon:
+                        ml_results = analyze_with_ml(
+                            st.session_state.uploaded_image,
+                            st.session_state.lat,
+                            st.session_state.lon
+                        )
+                        if ml_results:
+                            st.session_state.image_analysis = ml_results['results']
+                            st.session_state.terrain_stats = ml_results['terrain_stats']
+                            st.success("✅ ML Analysis complete!")
+                            st.rerun()
+                    else:
+                        st.warning("Please select a location on the map first")
+        
+        with col2:
+            if st.button("🚀 Analyze with Tambo.ai", 
+                        type="secondary",
+                        disabled=not use_tamboai):
+                with st.spinner("Calling Tambo.ai API..."):
+                    if st.session_state.lat and st.session_state.lon:
+                        tamboai_results = analyze_with_tamboai(
+                            st.session_state.uploaded_image,
+                            st.session_state.lat,
+                            st.session_state.lon
+                        )
+                        if tamboai_results["success"]:
+                            st.session_state.tamboai_results = tamboai_results
+                            st.success(f"✅ Tambo.ai Analysis complete! (Confidence: {tamboai_results['confidence']:.1%})")
+                            st.rerun()
+                        else:
+                            st.error(f"Tambo.ai Error: {tamboai_results['error']}")
+                    else:
+                        st.warning("Please select a location on the map first")
     
     st.markdown("---")
     
@@ -291,10 +427,21 @@ with st.sidebar:
     else:
         st.info("👆 Click on map to start")
     
-    if USE_ML_BACKEND:
-        st.success("🤖 ML Backend: Active")
-    else:
-        st.warning("🤖 ML Backend: Using Mock Data")
+    # Backend Status
+    col1, col2 = st.columns(2)
+    with col1:
+        if USE_ML_BACKEND:
+            st.success("🤖 ML: Active")
+        else:
+            st.warning("🤖 ML: Mock")
+    
+    with col2:
+        if use_tamboai and TAMBOAI_API_KEY != "tambo_3mb+KRUZYXEITGLhWMWuyJhEj6A9cFiiuEiTtcRFNeyHb947GBqw5sRI03dgVK60O586gdffIAo1S6WgazcxvFBX4iDbQgZmN1e/24pApQg=":
+            st.success("🚀 Tambo.ai: Ready")
+        elif use_tamboai:
+            st.error("🚀 Tambo.ai: No API Key")
+        else:
+            st.info("🚀 Tambo.ai: Off")
 
 # --------------------------------------------------
 # Main Content
@@ -396,10 +543,16 @@ with col1:
             st.session_state.lon = clicked_lon
             
             with st.spinner("🔍 Analyzing location..."):
-                # Generate environmental proxies
-                ndvi_base = round(random.uniform(0.4, 0.9), 2)
-                water = round(random.uniform(0.3, 0.8), 2)
-                soil = round(random.uniform(0.4, 0.9), 2)
+                # Generate environmental proxies - use Tambo.ai data if available
+                if st.session_state.tamboai_results and st.session_state.tamboai_results.get("success"):
+                    env_factors = st.session_state.tamboai_results.get("environmental_factors", {})
+                    ndvi_base = env_factors.get("ndvi", random.uniform(0.4, 0.9))
+                    water = env_factors.get("water_availability", random.uniform(0.3, 0.8))
+                    soil = env_factors.get("soil_quality", random.uniform(0.4, 0.9))
+                else:
+                    ndvi_base = round(random.uniform(0.4, 0.9), 2)
+                    water = round(random.uniform(0.3, 0.8), 2)
+                    soil = round(random.uniform(0.4, 0.9), 2)
                 
                 st.session_state.env = {
                     "ndvi": ndvi_base,
@@ -407,11 +560,17 @@ with col1:
                     "soil": soil
                 }
                 
-                # Generate points
+                # Generate points - prioritize Tambo.ai suitability scores
+                suitability_data = None
+                if st.session_state.tamboai_results and st.session_state.tamboai_results.get("success"):
+                    suitability_data = st.session_state.tamboai_results.get("suitability_scores")
+                elif st.session_state.image_analysis:
+                    suitability_data = st.session_state.image_analysis
+                
                 points = generate_plantation_points_ml(
                     clicked_lat, 
                     clicked_lon,
-                    st.session_state.suitability_map
+                    suitability_data
                 )
                 
                 # Limit to requested number
@@ -478,6 +637,30 @@ with col2:
             st.info("ℹ️ Good site with some constraints")
         else:
             st.warning("⚠️ Challenging site - careful planning needed")
+    
+    # Tambo.ai Results
+    if st.session_state.tamboai_results and st.session_state.tamboai_results.get("success"):
+        st.markdown("---")
+        st.markdown("### 🚀 Tambo.ai Analysis")
+        
+        tamboai_data = st.session_state.tamboai_results
+        
+        st.metric(
+            "Confidence Score",
+            f"{tamboai_data.get('confidence', 0):.1%}",
+            help="Tambo.ai analysis confidence"
+        )
+        
+        with st.expander("View Tambo.ai Details"):
+            if tamboai_data.get("recommendations"):
+                st.write("**Recommended Species:**")
+                for species in tamboai_data["recommendations"][:5]:
+                    st.write(f"• {species}")
+            
+            if tamboai_data.get("environmental_factors"):
+                st.write("**Environmental Analysis:**")
+                for key, value in tamboai_data["environmental_factors"].items():
+                    st.write(f"**{key}:** {value:.2f}")
     
     # ML Analysis Results
     if st.session_state.image_analysis:
@@ -602,11 +785,12 @@ with info_col1:
     ### 💡 How to Use
     
     1. **Select Location**: Click anywhere on the map
-    2. **Optional**: Upload satellite image for ML analysis
-    3. **View Results**: Check environmental metrics and suitability
-    4. **Review Points**: Click on green markers for details
-    5. **Download**: Get CSV, GeoJSON, or KML format
-    6. **Plant**: Use GPS coordinates in the field!
+    2. **Optional**: Upload satellite image for analysis
+    3. **Choose Analysis**: Use ML or Tambo.ai (toggle in sidebar)
+    4. **View Results**: Check environmental metrics and suitability
+    5. **Review Points**: Click on green markers for details
+    6. **Download**: Get CSV, GeoJSON, or KML format
+    7. **Plant**: Use GPS coordinates in the field!
     """)
 
 with info_col2:
@@ -618,6 +802,11 @@ with info_col2:
     - 🔥 **Heatmap**: Suitability intensity (red = high)
     - **Score Range**: 0-100 (higher = better)
     - **Min Spacing**: Trees won't compete for resources
+    
+    ### 🔧 Backends
+    
+    - **🤖 Custom ML**: Local terrain & vegetation analysis
+    - **🚀 Tambo.ai**: Cloud-based satellite intelligence
     """)
 
 # --------------------------------------------------
@@ -629,7 +818,7 @@ st.markdown(
     <div style='text-align: center; color: #666; padding: 1rem;'>
         <p><b>🌱 Plantation Optimizer</b> | Powered by AI & ML | Built for environmental impact</p>
         <p style='font-size: 0.8rem;'>
-            Uses Random Forest terrain classification, NDVI analysis, and smart optimization algorithms
+            Uses Random Forest terrain classification, NDVI analysis, Tambo.ai satellite intelligence, and smart optimization algorithms
         </p>
     </div>
     """,
