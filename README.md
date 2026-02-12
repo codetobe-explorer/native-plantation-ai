@@ -60,7 +60,7 @@ scikit-learn>=1.3.0
 
 ### 1. Clone the Repository
 ```bash
-git clone https://github.com/yourusername/plantation-optimizer.git
+git clone https://github.com/codetobe-explorer/plantation-optimizer.git
 cd plantation-optimizer
 ```
 
